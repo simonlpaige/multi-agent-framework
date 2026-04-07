@@ -177,6 +177,7 @@ class ParallelPipeline:
         agents: List["BaseAgent"],
         aggregator: Optional["BaseAgent"] = None,
         max_concurrency: int = 10,
+        min_success_ratio: float = 0.5,
     ):
         """
         Parameters
@@ -187,12 +188,17 @@ class ParallelPipeline:
             If provided, receives all agent outputs and produces a final synthesis.
         max_concurrency : int
             Maximum simultaneous agent calls.
+        min_success_ratio : float
+            Minimum fraction of agents that must succeed before aggregation
+            proceeds. If fewer succeed, the pipeline is marked as failed and
+            aggregation is skipped. Default: 0.5 (50%).
         """
         if not agents:
             raise ValueError("ParallelPipeline requires at least one agent.")
         self.agents = agents
         self.aggregator = aggregator
         self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.min_success_ratio = min_success_ratio
 
     async def _run_agent(self, agent: "BaseAgent", task: str) -> StageResult:
         start = time.monotonic()
@@ -232,20 +238,44 @@ class ParallelPipeline:
         result.stages = list(stages)
         result.success = all(s.success for s in stages)
 
-        successful_outputs = [s.output for s in stages if s.success]
+        successful = [s for s in stages if s.success]
+        failed = [s for s in stages if not s.success]
+        success_ratio = len(successful) / len(stages) if stages else 0
 
-        if self.aggregator and successful_outputs:
-            # Build an aggregation prompt
-            outputs_block = "\n\n---\n\n".join(
-                f"**{stages[i].agent_name}**:\n{stages[i].output}"
-                for i, s in enumerate(stages)
-                if s.success
+        # Check minimum success threshold before aggregating
+        if success_ratio < self.min_success_ratio:
+            logger.error(
+                "ParallelPipeline: only %d/%d agents succeeded (%.0f%%), "
+                "below min_success_ratio=%.0f%%. Skipping aggregation.",
+                len(successful), len(stages),
+                success_ratio * 100, self.min_success_ratio * 100,
             )
+            result.success = False
+            result.final_output = "\n\n".join(s.output for s in successful)
+        elif self.aggregator and successful:
+            # Build aggregation prompt that includes both successes and failures
+            # so the aggregator knows the synthesis is based on partial data
+            outputs_block = "\n\n---\n\n".join(
+                f"**{s.agent_name}** (success):\n{s.output}"
+                for s in successful
+            )
+            if failed:
+                failures_note = (
+                    "\n\n⚠️ **The following agents failed and their output is unavailable:**\n"
+                    + "\n".join(
+                        f"- **{s.agent_name}**: {s.error or 'unknown error'}"
+                        for s in failed
+                    )
+                    + "\n\nPlease note that this synthesis is based on partial results."
+                )
+            else:
+                failures_note = ""
             agg_prompt = (
                 f"You have received the following outputs from your team. "
                 f"Synthesize them into a single coherent response that addresses the original task.\n\n"
                 f"Original task: {task}\n\n"
                 f"Team outputs:\n{outputs_block}"
+                f"{failures_note}"
             )
             agg_start = time.monotonic()
             try:
@@ -261,9 +291,9 @@ class ParallelPipeline:
                 result.final_output = final
             except Exception as exc:
                 logger.error("ParallelPipeline aggregator failed: %s", exc)
-                result.final_output = "\n\n".join(successful_outputs)
+                result.final_output = "\n\n".join(s.output for s in successful)
         else:
-            result.final_output = "\n\n".join(successful_outputs)
+            result.final_output = "\n\n".join(s.output for s in successful)
 
         result.total_duration_seconds = time.monotonic() - start_total
         return result
