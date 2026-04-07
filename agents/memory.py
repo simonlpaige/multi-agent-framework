@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 
@@ -64,6 +66,31 @@ class AgentMemory:
             mem.add_message(msg["role"], msg["content"])
         mem._scratchpad = data.get("scratchpad", {})
         return mem
+
+    # --- Persistence ---
+
+    def save(self, path: str | os.PathLike) -> None:
+        """Persist memory to a JSON file. Creates parent directories if needed."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | os.PathLike, max_history: int = 50) -> "AgentMemory":
+        """Load memory from a JSON file previously saved with :meth:`save`.
+
+        Args:
+            path: Path to the JSON file written by :meth:`save`.
+            max_history: Maximum number of messages to keep after loading.
+
+        Returns:
+            A new :class:`AgentMemory` instance populated from the file.
+
+        Raises:
+            FileNotFoundError: If *path* does not exist.
+        """
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(data, max_history=max_history)
 
     def __repr__(self) -> str:
         return f"<AgentMemory messages={len(self._history)} scratchpad_keys={list(self._scratchpad.keys())}>"
