@@ -92,6 +92,43 @@ class AgentMemory:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data, max_history=max_history)
 
+    def summary(self, max_messages: int = 10) -> str:
+        """Return a compact text summary of recent conversation history.
+
+        Useful for handing off context between agents without passing the
+        full history — e.g., when a CEO agent needs to brief an Engineer
+        on what was discussed with the Researcher.
+
+        Args:
+            max_messages: Maximum number of recent messages to include.
+
+        Returns:
+            A formatted string with recent messages and scratchpad keys.
+        """
+        recent = list(self._history)[-max_messages:]
+        if not recent:
+            return "(no conversation history)"
+
+        lines = []
+        for msg in recent:
+            role = msg["role"].upper()
+            # Truncate long messages to keep the summary digestible
+            content = msg["content"]
+            if len(content) > 200:
+                content = content[:197] + "..."
+            lines.append(f"[{role}] {content}")
+
+        if self._scratchpad:
+            lines.append(f"\nScratchpad: {', '.join(self._scratchpad.keys())}")
+
+        return "\n".join(lines)
+
+    @property
+    def token_estimate(self) -> int:
+        """Rough token estimate for the full history (4 chars ≈ 1 token)."""
+        total_chars = sum(len(m["content"]) for m in self._history)
+        return total_chars // 4
+
     def __repr__(self) -> str:
         return f"<AgentMemory messages={len(self._history)} scratchpad_keys={list(self._scratchpad.keys())}>"
 
