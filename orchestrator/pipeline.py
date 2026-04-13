@@ -71,6 +71,8 @@ class SequentialPipeline:
         agents: List["BaseAgent"],
         pass_context: bool = True,
         transform: Optional[TransformFn] = None,
+        max_retries: int = 0,
+        retry_delay: float = 1.0,
     ):
         """
         Parameters
@@ -81,12 +83,19 @@ class SequentialPipeline:
             If True, each agent receives the previous agent's output as additional context.
         transform : Optional[TransformFn]
             Custom function to build the next stage's prompt from (prev_output, original_task).
+        max_retries : int
+            Number of retries per stage on failure (0 = no retries). Useful for
+            transient API errors that shouldn't kill the whole pipeline.
+        retry_delay : float
+            Seconds to wait between retries (doubles on each attempt).
         """
         if not agents:
             raise ValueError("SequentialPipeline requires at least one agent.")
         self.agents = agents
         self.pass_context = pass_context
         self.transform = transform
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
 
     async def run(self, task: str) -> PipelineResult:
         """
@@ -107,50 +116,73 @@ class SequentialPipeline:
             stage_start = time.monotonic()
             stage_input = current_input
 
-            try:
-                output = await agent.act(stage_input)
-                duration = time.monotonic() - stage_start
-                stage_result = StageResult(
-                    agent_name=agent.name,
-                    input=stage_input,
-                    output=output,
-                    duration_seconds=duration,
-                    success=True,
-                )
-                result.stages.append(stage_result)
-                logger.info(
-                    "Pipeline [%s] stage complete (%.2fs)",
-                    agent.name,
-                    duration,
-                )
+            last_error: Optional[Exception] = None
+            for attempt in range(1 + self.max_retries):
+                if attempt > 0:
+                    delay = self.retry_delay * (2 ** (attempt - 1))
+                    logger.info(
+                        "Pipeline [%s] retry %d/%d in %.1fs",
+                        agent.name, attempt, self.max_retries, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    stage_start = time.monotonic()  # reset timer for retry
 
-                # Build input for the next stage
-                if self.pass_context:
-                    if self.transform:
-                        current_input = self.transform(output, task)
+                try:
+                    output = await agent.act(stage_input)
+                    duration = time.monotonic() - stage_start
+                    stage_result = StageResult(
+                        agent_name=agent.name,
+                        input=stage_input,
+                        output=output,
+                        duration_seconds=duration,
+                        success=True,
+                    )
+                    result.stages.append(stage_result)
+                    logger.info(
+                        "Pipeline [%s] stage complete (%.2fs)",
+                        agent.name,
+                        duration,
+                    )
+
+                    # Build input for the next stage
+                    if self.pass_context:
+                        if self.transform:
+                            current_input = self.transform(output, task)
+                        else:
+                            current_input = (
+                                f"Previous output from {agent.name}:\n{output}\n\n"
+                                f"Original task: {task}"
+                            )
                     else:
-                        current_input = (
-                            f"Previous output from {agent.name}:\n{output}\n\n"
-                            f"Original task: {task}"
-                        )
-                else:
-                    current_input = task
+                        current_input = task
 
-            except Exception as exc:
+                    last_error = None
+                    break  # success — move to next stage
+
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Pipeline [%s] attempt %d failed: %s",
+                        agent.name, attempt + 1, exc,
+                    )
+
+            if last_error is not None:
                 duration = time.monotonic() - stage_start
-                logger.error("Pipeline [%s] stage failed: %s", agent.name, exc)
+                logger.error(
+                    "Pipeline [%s] stage failed after %d attempts: %s",
+                    agent.name, 1 + self.max_retries, last_error,
+                )
                 stage_result = StageResult(
                     agent_name=agent.name,
                     input=stage_input,
                     output="",
                     duration_seconds=duration,
                     success=False,
-                    error=str(exc),
+                    error=str(last_error),
                 )
                 result.stages.append(stage_result)
                 result.success = False
-                # Stop pipeline on error
-                break
+                break  # stop pipeline on exhausted retries
 
         result.total_duration_seconds = time.monotonic() - start_total
         result.final_output = result.stages[-1].output if result.stages else ""
